@@ -3,12 +3,18 @@ from PIL import Image
 from dit import VideoGeneration
 from diffusers.utils import load_image, export_to_video
 
+
+from huggingface_hub import snapshot_download
+
+model_path = 'PATH'   # The local directory to save downloaded checkpoint
+snapshot_download("rain1011/pyramid-flow-miniflux", local_dir=model_path, local_dir_use_symlinks=False, repo_type='model')
+
 torch.cuda.set_device(0)
 model_dtype, torch_dtype = 'bf16', torch.bfloat16   # Use bf16 (not support fp16 yet)
 
 model = VideoGeneration(
     'PATH',                                         # The downloaded checkpoint dir
-    model_name="pyramid_flux",
+    model_name="pyramid_flux",  # pyramid_mmdit, pyramid_flux
     model_dtype=model_dtype,
     model_variant='diffusion_transformer_768p',
 )
