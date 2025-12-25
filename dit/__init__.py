@@ -1,3 +1,3 @@
-from .video_gen_pipeline import PyramidDiTForVideoGeneration
+from .video_gen_pipeline import PyramidDiTForVideoGeneration as VideoGeneration
 from .flux import FluxSingleTransformerBlock, FluxTransformerBlock, FluxTextEncoderWithMask
 from .mmdit import JointTransformerBlock, SD3TextEncoderWithMask
