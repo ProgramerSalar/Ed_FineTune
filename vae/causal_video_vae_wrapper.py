@@ -8,18 +8,7 @@ from einops import rearrange
 from PIL import Image
 from IPython import embed
 
-from utils import (
-    is_context_parallel_initialized,
-    get_context_parallel_group,
-    get_context_parallel_world_size,
-    get_context_parallel_rank,
-    get_context_parallel_group_rank,
-)
 
-from .context_parallel_ops import (
-    conv_scatter_to_context_parallel_region,
-    conv_gather_from_context_parallel_region,
-)
 
 
 class CausalVideoVAELossWrapper(nn.Module):
@@ -57,13 +46,12 @@ class CausalVideoVAELossWrapper(nn.Module):
             self.loss = LPIPSWithDiscriminator(disc_start, logvar_init=logvar_init, kl_weight=kl_weight,
                 pixelloss_weight=pixelloss_weight, perceptual_weight=perceptual_weight, disc_weight=disc_weight, 
                 add_discriminator=add_discriminator, using_3d_discriminator=False, disc_num_layers=4, lpips_ckpt=lpips_ckpt)
-        else:
-            self.loss = None
+        
 
         self.disc_start = disc_start
 
     def load_checkpoint(self, checkpoint_path, **kwargs):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         if 'model' in checkpoint:
             checkpoint = checkpoint['model']
 
@@ -103,15 +91,8 @@ class CausalVideoVAELossWrapper(nn.Module):
             x = rearrange(x, 'b c t h w -> (b t) c h w')
             x = x.unsqueeze(2)  # [(b t) c 1 h w]
 
-        if is_context_parallel_initialized():
-            assert self.training, "Only supports during training now"
-            cp_world_size = get_context_parallel_world_size()
-            global_src_rank = get_context_parallel_group_rank() * cp_world_size
-            # sync the input and split
-            torch.distributed.broadcast(x, src=global_src_rank, group=get_context_parallel_group())
-            batch_x = conv_scatter_to_context_parallel_region(x, dim=2, kernel_size=1)
-        else:
-            batch_x = x
+        
+        batch_x = x
 
         posterior, reconstruct = self.vae(batch_x, freeze_encoder=self.freeze_encoder, 
                     is_init_image=True, temporal_chunk=False,)
@@ -134,28 +115,86 @@ class CausalVideoVAELossWrapper(nn.Module):
 
         return reconstruct_loss, gan_loss, loss_log
 
-    def encode(self, x, sample=False, is_init_image=True, 
+    
+    
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+    
+
+    # <------------------ This phase to when you test your video to your train model weight how is that ----------------------------------->
+    # encode vae latent
+    def encode_latent(self, x, sample=False, is_init_image=True, 
             temporal_chunk=False, window_size=16, tile_sample_min_size=256,):
-        # x: (B, C, T, H, W) or (B, C, H, W)
-        B = x.shape[0]
-        xdim = x.ndim
-
-        if xdim == 4:
-            # The input is an image
-            x = x.unsqueeze(2)
-
+        # Encode
+        latent = self.encode(
+            x, sample, is_init_image, temporal_chunk, window_size, tile_sample_min_size,
+        )
+        return latent
+    
+    def encode(self, 
+               x, 
+               sample=False,
+               is_init_image=True,
+               temporal_chunk=False,
+               window_size=16,
+               tile_sample_min_size=256):
+        
+        # x: [B, c, t, h, w]
+        b = x.shape[0]
+        
         if sample:
-            x = self.vae.encode(
-                x, is_init_image=is_init_image, temporal_chunk=temporal_chunk,
-                window_size=window_size, tile_sample_min_size=tile_sample_min_size,
-            ).latent_dist.sample()
+            x = self.vae.encode(x,
+                                is_init_image=is_init_image,
+                                temporal_chunk=temporal_chunk,
+                                window_size=window_size,
+                                tile_sample_min_size=256).latent_dist.sample()
         else:
             x = self.vae.encode(
                 x, is_init_image=is_init_image, temporal_chunk=temporal_chunk,
                 window_size=window_size, tile_sample_min_size=tile_sample_min_size,
             ).latent_dist.mode()
 
-        return x
+        return x 
+    
+
+    # ----------------------
+
+    # decode vae latent
+    def decode_latent(self, latent, is_init_image=True, 
+        temporal_chunk=False, window_size=2, tile_sample_min_size=256,):
+        x = self.decode(
+            latent, is_init_image, temporal_chunk, window_size, tile_sample_min_size
+        )
+        output_image = x.float()
+        output_image = (output_image / 2 + 0.5).clamp(0, 1)
+        # Convert to PIL images
+        output_image = rearrange(output_image, "B C T H W -> (B T) C H W")
+        output_image = output_image.cpu().permute(0, 2, 3, 1).numpy()
+        output_images = self.numpy_to_pil(output_image)
+        return output_images
+    
+
+    @staticmethod
+    def numpy_to_pil(images):
+        """
+        Convert a numpy image or a batch of images to a PIL image.
+        """
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = (images * 255).round().astype("uint8")
+        if images.shape[-1] == 1:
+            # special case for grayscale (single channel) images
+            pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+        else:
+            pil_images = [Image.fromarray(image) for image in images]
+
+        return pil_images
+    
 
     def decode(self, x, is_init_image=True, temporal_chunk=False, 
             window_size=2, tile_sample_min_size=256,):
@@ -173,82 +212,9 @@ class CausalVideoVAELossWrapper(nn.Module):
         ).sample
 
         return x
-
-    @staticmethod
-    def numpy_to_pil(images):
-        """
-        Convert a numpy image or a batch of images to a PIL image.
-        """
-        if images.ndim == 3:
-            images = images[None, ...]
-        images = (images * 255).round().astype("uint8")
-        if images.shape[-1] == 1:
-            # special case for grayscale (single channel) images
-            pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
-        else:
-            pil_images = [Image.fromarray(image) for image in images]
-
-        return pil_images
-
-    def reconstruct(
-        self, x, sample=False, return_latent=False, is_init_image=True, 
-        temporal_chunk=False, window_size=16, tile_sample_min_size=256, **kwargs
-    ):
-        assert x.shape[0] == 1
-        xdim = x.ndim
-        encode_window_size = window_size
-        decode_window_size = window_size // self.vae.downsample_scale
-
-        # Encode
-        x = self.encode(
-            x, sample, is_init_image, temporal_chunk, encode_window_size, tile_sample_min_size,
-        )
-        encode_latent = x
-
-        # Decode
-        x = self.decode(
-            x, is_init_image, temporal_chunk, decode_window_size, tile_sample_min_size
-        )
-        output_image = x.float()
-        output_image = (output_image / 2 + 0.5).clamp(0, 1)
-
-        # Convert to PIL images
-        output_image = rearrange(output_image, "B C T H W -> (B T) C H W")
-        output_image = output_image.cpu().permute(0, 2, 3, 1).numpy()
-        output_images = self.numpy_to_pil(output_image)
-
-        if return_latent:
-            return output_images, encode_latent
-        
-        return output_images
-
-    # encode vae latent
-    def encode_latent(self, x, sample=False, is_init_image=True, 
-            temporal_chunk=False, window_size=16, tile_sample_min_size=256,):
-        # Encode
-        latent = self.encode(
-            x, sample, is_init_image, temporal_chunk, window_size, tile_sample_min_size,
-        )
-        return latent
-
-    # decode vae latent
-    def decode_latent(self, latent, is_init_image=True, 
-        temporal_chunk=False, window_size=2, tile_sample_min_size=256,):
-        x = self.decode(
-            latent, is_init_image, temporal_chunk, window_size, tile_sample_min_size
-        )
-        output_image = x.float()
-        output_image = (output_image / 2 + 0.5).clamp(0, 1)
-        # Convert to PIL images
-        output_image = rearrange(output_image, "B C T H W -> (B T) C H W")
-        output_image = output_image.cpu().permute(0, 2, 3, 1).numpy()
-        output_images = self.numpy_to_pil(output_image)
-        return output_images
     
-    @property
-    def device(self):
-        return next(self.parameters()).device
 
-    @property
-    def dtype(self):
-        return next(self.parameters()).dtype
+
+    
+
+    

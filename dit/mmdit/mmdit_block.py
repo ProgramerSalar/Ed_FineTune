@@ -21,7 +21,7 @@ from trainer_misc import (
     all_to_all,
 )
 
-from .modeling_normalization import AdaLayerNormZero, AdaLayerNormContinuous, RMSNorm
+from .normalization import AdaLayerNormZero, AdaLayerNormContinuous, RMSNorm
 
 
 class FeedForward(nn.Module):

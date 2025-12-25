@@ -75,8 +75,7 @@ class LPIPSWithDiscriminator(nn.Module):
             self.discriminator = disc_cls(
                 input_nc=disc_in_channels, n_layers=disc_num_layers,
             ).apply(weights_init)
-        else:
-            self.discriminator = None
+        
     
         self.discriminator_iter_start = disc_start
         self.disc_loss = hinge_d_loss if disc_loss == "hinge" else vanilla_d_loss
@@ -114,7 +113,8 @@ class LPIPSWithDiscriminator(nn.Module):
         t = reconstructions.shape[2]
         inputs = rearrange(inputs, "b c t h w -> (b t) c h w").contiguous()
         reconstructions = rearrange(reconstructions, "b c t h w -> (b t) c h w").contiguous()
-    
+
+
         if optimizer_idx == 0:
             # rec_loss = torch.mean(torch.abs(inputs - reconstructions), dim=(1,2,3), keepdim=True)
             rec_loss = torch.mean(F.mse_loss(inputs, reconstructions, reduction='none'), dim=(1,2,3), keepdim=True)

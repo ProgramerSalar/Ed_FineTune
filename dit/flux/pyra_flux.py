@@ -1,18 +1,20 @@
+from typing import Any, Dict, List, Optional, Union
+
 import torch
-import torch.nn as nn
 import os
+import torch.nn as nn
 import torch.nn.functional as F
-
 from einops import rearrange
-from diffusers.utils.torch_utils import randn_tensor
-from diffusers.models.modeling_utils import ModelMixin
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.utils import is_torch_version
-from typing import Any, Callable, Dict, List, Optional, Union
+from tqdm import tqdm
 
-from .modeling_embedding import PatchEmbed3D, CombinedTimestepConditionEmbeddings
-from .modeling_normalization import AdaLayerNormContinuous
-from .modeling_mmdit_block import JointTransformerBlock
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.utils import is_torch_version
+
+from .normalization import AdaLayerNormContinuous
+from .embedding import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings
+from .flux_block import FluxTransformerBlock, FluxSingleTransformerBlock
 
 from trainer_misc import (
     is_sequence_parallel_initialized,
@@ -21,8 +23,6 @@ from trainer_misc import (
     get_sequence_parallel_rank,
     all_to_all,
 )
-
-from IPython import embed
 
 
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
@@ -41,7 +41,7 @@ def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
     return out.float()
 
 
-class EmbedNDRoPE(nn.Module):
+class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: List[int]):
         super().__init__()
         self.dim = dim
@@ -57,103 +57,94 @@ class EmbedNDRoPE(nn.Module):
         return emb.unsqueeze(2)
 
 
-class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
+class PyramidFluxTransformer(ModelMixin, ConfigMixin):
+    """
+    The Transformer model introduced in Flux.
+
+    Reference: https://blackforestlabs.ai/announcing-black-forest-labs/
+
+    Parameters:
+        patch_size (`int`): Patch size to turn the input data into small patches.
+        in_channels (`int`, *optional*, defaults to 16): The number of channels in the input.
+        num_layers (`int`, *optional*, defaults to 18): The number of layers of MMDiT blocks to use.
+        num_single_layers (`int`, *optional*, defaults to 18): The number of layers of single DiT blocks to use.
+        attention_head_dim (`int`, *optional*, defaults to 64): The number of channels in each head.
+        num_attention_heads (`int`, *optional*, defaults to 18): The number of heads to use for multi-head attention.
+        joint_attention_dim (`int`, *optional*): The number of `encoder_hidden_states` dimensions to use.
+        pooled_projection_dim (`int`): Number of dimensions to use when projecting the `pooled_projections`.
+    """
+
     _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(
         self,
-        sample_size: int = 128,
-        patch_size: int = 2,
-        in_channels: int = 16,
-        num_layers: int = 24,
+        patch_size: int = 1,
+        in_channels: int = 64,
+        num_layers: int = 19,
+        num_single_layers: int = 38,
         attention_head_dim: int = 64,
         num_attention_heads: int = 24,
-        caption_projection_dim: int = 1152,
-        pooled_projection_dim: int = 2048,
-        pos_embed_max_size: int = 192,
-        max_num_frames: int = 200,
-        qk_norm: str = 'rms_norm',
-        pos_embed_type: str = 'rope',
-        temp_pos_embed_type: str = 'sincos',
         joint_attention_dim: int = 4096,
+        pooled_projection_dim: int = 768,
+        axes_dims_rope: List[int] = [16, 24, 24],
+        use_flash_attn: bool = False,
+        use_temporal_causal: bool = True,
+        interp_condition_pos: bool = True,
         use_gradient_checkpointing: bool = False,
-        use_flash_attn: bool = True,
-        use_temporal_causal: bool = False,
-        use_t5_mask: bool = False,
-        add_temp_pos_embed: bool = False,
-        interp_condition_pos: bool = False,
         gradient_checkpointing_ratio: float = 0.6,
     ):
         super().__init__()
-
         self.out_channels = in_channels
-        self.inner_dim = num_attention_heads * attention_head_dim
-        assert temp_pos_embed_type in ['rope', 'sincos']
+        self.inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
 
-        # The input latent embeder, using the name pos_embed to remain the same with SD#
-        self.pos_embed = PatchEmbed3D(
-            height=sample_size,
-            width=sample_size,
-            patch_size=patch_size,
-            in_channels=in_channels,
-            embed_dim=self.inner_dim,
-            pos_embed_max_size=pos_embed_max_size,  # hard-code for now.
-            max_num_frames=max_num_frames,
-            pos_embed_type=pos_embed_type,
-            temp_pos_embed_type=temp_pos_embed_type,
-            add_temp_pos_embed=add_temp_pos_embed,
-            interp_condition_pos=interp_condition_pos,
+        self.pos_embed = EmbedND(dim=self.inner_dim, theta=10000, axes_dim=axes_dims_rope)
+        self.time_text_embed = CombinedTimestepTextProjEmbeddings(
+            embedding_dim=self.inner_dim, pooled_projection_dim=self.config.pooled_projection_dim
         )
 
-        # The RoPE EMbedding
-        if pos_embed_type == 'rope':
-            self.rope_embed = EmbedNDRoPE(self.inner_dim, 10000, axes_dim=[16, 24, 24])
-        else:
-            self.rope_embed = None
-
-        if temp_pos_embed_type == 'rope':
-            self.temp_rope_embed = EmbedNDRoPE(self.inner_dim, 10000, axes_dim=[attention_head_dim])
-        else:
-            self.temp_rope_embed = None
-
-        self.time_text_embed = CombinedTimestepConditionEmbeddings(
-            embedding_dim=self.inner_dim, pooled_projection_dim=self.config.pooled_projection_dim,
-        )
-        self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.config.caption_projection_dim)
+        self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.inner_dim)
+        self.x_embedder = torch.nn.Linear(self.config.in_channels, self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
-                JointTransformerBlock(
+                FluxTransformerBlock(
                     dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=self.inner_dim,
-                    qk_norm=qk_norm,
-                    context_pre_only=i == num_layers - 1,
+                    num_attention_heads=self.config.num_attention_heads,
+                    attention_head_dim=self.config.attention_head_dim,
                     use_flash_attn=use_flash_attn,
                 )
-                for i in range(num_layers)
+                for i in range(self.config.num_layers)
+            ]
+        )
+
+        self.single_transformer_blocks = nn.ModuleList(
+            [
+                FluxSingleTransformerBlock(
+                    dim=self.inner_dim,
+                    num_attention_heads=self.config.num_attention_heads,
+                    attention_head_dim=self.config.attention_head_dim,
+                    use_flash_attn=use_flash_attn,
+                )
+                for i in range(self.config.num_single_layers)
             ]
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
+
         self.gradient_checkpointing = use_gradient_checkpointing
         self.gradient_checkpointing_ratio = gradient_checkpointing_ratio
 
-        self.patch_size = patch_size
-        self.use_flash_attn = use_flash_attn
         self.use_temporal_causal = use_temporal_causal
-        self.pos_embed_type = pos_embed_type
-        self.temp_pos_embed_type = temp_pos_embed_type
-        self.add_temp_pos_embed = add_temp_pos_embed
-
         if self.use_temporal_causal:
             print("Using temporal causal attention")
-            assert self.use_flash_attn is False, "The flash attention does not support temporal causal"
-        
-        if interp_condition_pos:
-            print("We interp the position embedding of condition latents")
+
+        self.use_flash_attn = use_flash_attn
+        if self.use_flash_attn:
+            print("Using Flash attention")
+
+        self.patch_size = 2   # hard-code for now
 
         # init weights
         self.initialize_weights()
@@ -166,11 +157,6 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.pos_embed.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.pos_embed.proj.bias, 0)
 
         # Initialize all the conditioning to normal init
         nn.init.normal_(self.time_text_embed.timestep_embedder.linear_1.weight, std=0.02)
@@ -186,6 +172,10 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
             nn.init.constant_(block.norm1_context.linear.weight, 0)
             nn.init.constant_(block.norm1_context.linear.bias, 0)
 
+        for block in self.single_transformer_blocks:
+            nn.init.constant_(block.norm.linear.weight, 0)
+            nn.init.constant_(block.norm.linear.bias, 0)
+
         # Zero-out output layers:
         nn.init.constant_(self.norm_out.linear.weight, 0)
         nn.init.constant_(self.norm_out.linear.bias, 0)
@@ -193,54 +183,35 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
         nn.init.constant_(self.proj_out.bias, 0)
 
     @torch.no_grad()
-    def _prepare_latent_image_ids(self, batch_size, temp, height, width, device):
+    def _prepare_image_ids(self, batch_size, temp, height, width, train_height, train_width, device, start_time_stamp=0):
         latent_image_ids = torch.zeros(temp, height, width, 3)
-        latent_image_ids[..., 0] = latent_image_ids[..., 0] + torch.arange(temp)[:, None, None]
-        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[None, :, None]
-        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, None, :]
 
-        latent_image_ids = latent_image_ids[None, :].repeat(batch_size, 1, 1, 1, 1)
-        latent_image_ids = rearrange(latent_image_ids, 'b t h w c -> b (t h w) c')
-        return latent_image_ids.to(device=device)
-
-    @torch.no_grad()
-    def _prepare_pyramid_latent_image_ids(self, batch_size, temp_list, height_list, width_list, device):
-        base_width = width_list[-1]; base_height = height_list[-1]
-        assert base_width == max(width_list)
-        assert base_height == max(height_list)
-
-        image_ids_list = []
-        for temp, height, width in zip(temp_list, height_list, width_list):
-            latent_image_ids = torch.zeros(temp, height, width, 3)
-
-            if height != base_height:
-                height_pos = F.interpolate(torch.arange(base_height)[None, None, :].float(), height, mode='linear').squeeze(0, 1)
-            else:
-                height_pos = torch.arange(base_height).float()
-            if width != base_width:
-                width_pos = F.interpolate(torch.arange(base_width)[None, None, :].float(), width, mode='linear').squeeze(0, 1)
-            else:
-                width_pos = torch.arange(base_width).float()
-
-            latent_image_ids[..., 0] = latent_image_ids[..., 0] + torch.arange(temp)[:, None, None]  
-            latent_image_ids[..., 1] = latent_image_ids[..., 1] + height_pos[None, :, None]
-            latent_image_ids[..., 2] = latent_image_ids[..., 2] + width_pos[None, None, :]
-            latent_image_ids = latent_image_ids[None, :].repeat(batch_size, 1, 1, 1, 1)
-            latent_image_ids = rearrange(latent_image_ids, 'b t h w c -> b (t h w) c').to(device)
-            image_ids_list.append(latent_image_ids)
-    
-        return image_ids_list
-
-    @torch.no_grad()
-    def _prepare_temporal_rope_ids(self, batch_size, temp, height, width, device, start_time_stamp=0):
-        latent_image_ids = torch.zeros(temp, height, width, 1)
+        # Temporal Rope
         latent_image_ids[..., 0] = latent_image_ids[..., 0] + torch.arange(start_time_stamp, start_time_stamp + temp)[:, None, None]
+
+        # height Rope
+        if height != train_height:
+            height_pos = F.interpolate(torch.arange(train_height)[None, None, :].float(), height, mode='linear').squeeze(0, 1)
+        else:
+            height_pos = torch.arange(train_height).float()
+
+        latent_image_ids[..., 1] = latent_image_ids[..., 1] + height_pos[None, :, None]
+
+        # width rope
+        if width != train_width:
+            width_pos = F.interpolate(torch.arange(train_width)[None, None, :].float(), width, mode='linear').squeeze(0, 1)
+        else:
+            width_pos = torch.arange(train_width).float()
+
+        latent_image_ids[..., 2] = latent_image_ids[..., 2] + width_pos[None, None, :]
+
         latent_image_ids = latent_image_ids[None, :].repeat(batch_size, 1, 1, 1, 1)
         latent_image_ids = rearrange(latent_image_ids, 'b t h w c -> b (t h w) c')
+
         return latent_image_ids.to(device=device)
 
     @torch.no_grad()
-    def _prepare_pyramid_temporal_rope_ids(self, sample, batch_size, device):
+    def _prepare_pyramid_image_ids(self, sample, batch_size, device):
         image_ids_list = []
 
         for i_b, sample_ in enumerate(sample):
@@ -250,11 +221,14 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
             cur_image_ids = []
             start_time_stamp = 0
 
+            train_height = sample_[-1].shape[-2] // self.patch_size
+            train_width = sample_[-1].shape[-1] // self.patch_size
+
             for clip_ in sample_:
                 _, _, temp, height, width = clip_.shape
                 height = height // self.patch_size
                 width = width // self.patch_size
-                cur_image_ids.append(self._prepare_temporal_rope_ids(batch_size, temp, height, width, device, start_time_stamp=start_time_stamp))
+                cur_image_ids.append(self._prepare_image_ids(batch_size, temp, height, width, train_height, train_width, device, start_time_stamp=start_time_stamp))
                 start_time_stamp += temp
 
             cur_image_ids = torch.cat(cur_image_ids, dim=1)
@@ -289,36 +263,33 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
             width_list.append(width)
             trainable_token_list.append(height * width * temp)
 
-        # prepare the RoPE embedding if needed
-        if self.pos_embed_type == 'rope':
-            # TODO: support the 3D Rope for video
-            raise NotImplementedError("Not compatible with video generation now")
-            text_ids = torch.zeros(pad_batch_size, encoder_hidden_length, 3).to(device=device)
-            image_ids_list = self._prepare_pyramid_latent_image_ids(pad_batch_size, temp_list, height_list, width_list, device)
-            input_ids_list = [torch.cat([text_ids, image_ids], dim=1) for image_ids in image_ids_list]
-            image_rotary_emb = [self.rope_embed(input_ids) for input_ids in input_ids_list]  # [bs, seq_len, 1, head_dim // 2, 2, 2]
-        else:
-            if self.temp_pos_embed_type == 'rope' and self.add_temp_pos_embed:
-                image_ids_list = self._prepare_pyramid_temporal_rope_ids(sample, pad_batch_size, device)
-                text_ids = torch.zeros(pad_batch_size, encoder_attention_mask.shape[1], 1).to(device=device)    
-                input_ids_list = [torch.cat([text_ids, image_ids], dim=1) for image_ids in image_ids_list]
-                image_rotary_emb = [self.temp_rope_embed(input_ids) for input_ids in input_ids_list]  # [bs, seq_len, 1, head_dim // 2, 2, 2]
+        # prepare the RoPE IDs, 
+        image_ids_list = self._prepare_pyramid_image_ids(sample, pad_batch_size, device)
+        text_ids = torch.zeros(pad_batch_size, encoder_attention_mask.shape[1], 3).to(device=device)
+        input_ids_list = [torch.cat([text_ids, image_ids], dim=1) for image_ids in image_ids_list]
+        image_rotary_emb = [self.pos_embed(input_ids) for input_ids in input_ids_list]  # [bs, seq_len, 1, head_dim // 2, 2, 2]
 
-                if is_sequence_parallel_initialized():
-                    sp_group = get_sequence_parallel_group()
-                    sp_group_size = get_sequence_parallel_world_size()
-                    concat_output = True if self.training else False
-                    image_rotary_emb = [all_to_all(x_.repeat(1, 1, sp_group_size, 1, 1, 1), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output) for x_ in image_rotary_emb]
-                    input_ids_list = [all_to_all(input_ids.repeat(1, 1, sp_group_size), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output) for input_ids in input_ids_list]
+        if is_sequence_parallel_initialized():
+            sp_group = get_sequence_parallel_group()
+            sp_group_size = get_sequence_parallel_world_size()
+            concat_output = True if self.training else False
+            image_rotary_emb = [all_to_all(x_.repeat(1, 1, sp_group_size, 1, 1, 1), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output) for x_ in image_rotary_emb]
+            input_ids_list = [all_to_all(input_ids.repeat(1, 1, sp_group_size), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output) for input_ids in input_ids_list]
 
-            else:
-                image_rotary_emb = None
-
-        hidden_states = self.pos_embed(sample)  # hidden states is a list of [b c t h w] b = real_b // num_stages
-        hidden_length = []
+        hidden_states, hidden_length = [], []
     
-        for i_b in range(num_stages):
-            hidden_length.append(hidden_states[i_b].shape[1])
+        for sample_ in sample:
+            video_tokens = []
+
+            for each_latent in sample_:
+                each_latent = rearrange(each_latent, 'b c t h w -> b t h w c')
+                each_latent = rearrange(each_latent, 'b t (h p1) (w p2) c -> b (t h w) (p1 p2 c)', p1=self.patch_size, p2=self.patch_size)
+                video_tokens.append(each_latent)
+
+            video_tokens = torch.cat(video_tokens, dim=1)
+            video_tokens = self.x_embedder(video_tokens)
+            hidden_states.append(video_tokens)
+            hidden_length.append(video_tokens.shape[1])
 
         # prepare the attention mask
         if self.use_flash_attn:
@@ -347,6 +318,7 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
         else:
             assert encoder_attention_mask.shape[1] == encoder_hidden_length
             real_batch_size = encoder_attention_mask.shape[0]
+
             # prepare text ids
             text_ids = torch.arange(1, real_batch_size + 1, dtype=encoder_attention_mask.dtype).unsqueeze(1).repeat(1, encoder_hidden_length)
             text_ids = text_ids.to(device)
@@ -365,14 +337,14 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
                 concat_output = True if self.training else False
                 text_ids = all_to_all(text_ids.unsqueeze(2).repeat(1, 1, sp_group_size), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output).squeeze(2)
                 image_ids_list = [all_to_all(image_ids_.unsqueeze(2).repeat(1, 1, sp_group_size), sp_group, sp_group_size, scatter_dim=2, gather_dim=0, concat_output=concat_output).squeeze(2) for image_ids_ in image_ids_list]
-
+            
             attention_mask = []
             for i_p in range(len(hidden_length)):
                 image_ids = image_ids_list[i_p]
                 token_ids = torch.cat([text_ids[i_p::num_stages], image_ids], dim=1)
                 stage_attention_mask = rearrange(token_ids, 'b i -> b 1 i 1') == rearrange(token_ids, 'b j -> b 1 1 j')  # [bs, 1, q_len, k_len]
                 if self.use_temporal_causal:
-                    input_order_ids = input_ids_list[i_p].squeeze(2)
+                    input_order_ids = input_ids_list[i_p][:,:,0]
                     temporal_causal_mask = rearrange(input_order_ids, 'b i -> b 1 i 1') >= rearrange(input_order_ids, 'b j -> b 1 1 j')
                     stage_attention_mask = stage_attention_mask & temporal_causal_mask
                 attention_mask.append(stage_attention_mask)
@@ -409,7 +381,7 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
 
             # unpatchify
             hidden_states = hidden_states.reshape(
-                shape=(batch_size, temp, height, width, self.patch_size, self.patch_size, self.out_channels)
+                shape=(batch_size, temp, height, width, self.patch_size, self.patch_size, self.out_channels // 4)
             )
             hidden_states = rearrange(hidden_states, "b t h w p1 p2 c -> b t (h p1) (w p2) c")
             hidden_states = rearrange(hidden_states, "b t h w c -> b c t h w")
@@ -420,19 +392,18 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
     def forward(
         self,
         sample: torch.FloatTensor, # [num_stages]
-        encoder_hidden_states: torch.FloatTensor = None,
+        encoder_hidden_states: torch.Tensor = None,
         encoder_attention_mask: torch.FloatTensor = None,
-        pooled_projections: torch.FloatTensor = None,
-        timestep_ratio: torch.FloatTensor = None,
+        pooled_projections: torch.Tensor = None,
+        timestep_ratio: torch.LongTensor = None,
     ):
-        # Get the timestep embedding
         temb = self.time_text_embed(timestep_ratio, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
         encoder_hidden_length = encoder_hidden_states.shape[1]
 
         # Get the input sequence
-        hidden_states, hidden_length, temps, heights, widths, trainable_token_list, encoder_attention_mask, \
-                attention_mask, image_rotary_emb = self.merge_input(sample, encoder_hidden_length, encoder_attention_mask)
+        hidden_states, hidden_length, temps, heights, widths, trainable_token_list, encoder_attention_mask, attention_mask, \
+                image_rotary_emb = self.merge_input(sample, encoder_hidden_length, encoder_attention_mask)
         
         # split the long latents if necessary
         if is_sequence_parallel_initialized():
@@ -456,9 +427,9 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
         else:
             hidden_states = torch.cat(hidden_states, dim=1)
 
-        # print(hidden_length)
-        for i_b, block in enumerate(self.transformer_blocks):
-            if self.training and self.gradient_checkpointing and (i_b >= int(len(self.transformer_blocks) * self.gradient_checkpointing_ratio)):
+        for index_block, block in enumerate(self.transformer_blocks):
+            if self.training and self.gradient_checkpointing and (index_block <= int(len(self.transformer_blocks) * self.gradient_checkpointing_ratio)):
+
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs)
@@ -480,7 +451,7 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
 
             else:
                 encoder_hidden_states, hidden_states = block(
-                    hidden_states=hidden_states, 
+                    hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
@@ -489,6 +460,81 @@ class PyramidDiffusionMMDiT(ModelMixin, ConfigMixin):
                     image_rotary_emb=image_rotary_emb,
                 )
 
+        # remerge for single attention block
+        num_stages = len(hidden_length)
+        batch_hidden_states = list(torch.split(hidden_states, hidden_length, dim=1))
+        concat_hidden_length = []
+
+        if is_sequence_parallel_initialized():
+            sp_group = get_sequence_parallel_group()
+            sp_group_size = get_sequence_parallel_world_size()
+            encoder_hidden_states = all_to_all(encoder_hidden_states, sp_group, sp_group_size, scatter_dim=0, gather_dim=1)
+
+        for i_p in range(len(hidden_length)):
+
+            if is_sequence_parallel_initialized():
+                sp_group = get_sequence_parallel_group()
+                sp_group_size = get_sequence_parallel_world_size()
+                batch_hidden_states[i_p] = all_to_all(batch_hidden_states[i_p], sp_group, sp_group_size, scatter_dim=0, gather_dim=1)
+
+            batch_hidden_states[i_p] = torch.cat([encoder_hidden_states[i_p::num_stages], batch_hidden_states[i_p]], dim=1)
+
+            if is_sequence_parallel_initialized():
+                sp_group = get_sequence_parallel_group()
+                sp_group_size = get_sequence_parallel_world_size()
+                batch_hidden_states[i_p] = all_to_all(batch_hidden_states[i_p], sp_group, sp_group_size, scatter_dim=1, gather_dim=0)
+
+            concat_hidden_length.append(batch_hidden_states[i_p].shape[1])
+
+        hidden_states = torch.cat(batch_hidden_states, dim=1)
+
+        for index_block, block in enumerate(self.single_transformer_blocks):
+            if self.training and self.gradient_checkpointing and (index_block <= int(len(self.single_transformer_blocks) * self.gradient_checkpointing_ratio)):
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    temb,
+                    encoder_attention_mask,
+                    attention_mask,
+                    concat_hidden_length,
+                    image_rotary_emb,
+                    **ckpt_kwargs,
+                )
+
+            else:
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    encoder_attention_mask=encoder_attention_mask,      # used for 
+                    attention_mask=attention_mask,
+                    hidden_length=concat_hidden_length,
+                    image_rotary_emb=image_rotary_emb,
+                )
+
+        batch_hidden_states = list(torch.split(hidden_states, concat_hidden_length, dim=1))
+
+        for i_p in range(len(concat_hidden_length)):
+            if is_sequence_parallel_initialized():
+                sp_group = get_sequence_parallel_group()
+                sp_group_size = get_sequence_parallel_world_size()
+                batch_hidden_states[i_p] = all_to_all(batch_hidden_states[i_p], sp_group, sp_group_size, scatter_dim=0, gather_dim=1)
+            
+            batch_hidden_states[i_p] = batch_hidden_states[i_p][:, encoder_hidden_length :, ...]
+
+            if is_sequence_parallel_initialized():
+                sp_group = get_sequence_parallel_group()
+                sp_group_size = get_sequence_parallel_world_size()
+                batch_hidden_states[i_p] = all_to_all(batch_hidden_states[i_p], sp_group, sp_group_size, scatter_dim=1, gather_dim=0)
+            
+        hidden_states = torch.cat(batch_hidden_states, dim=1)
         hidden_states = self.norm_out(hidden_states, temb, hidden_length=hidden_length)
         hidden_states = self.proj_out(hidden_states)
 

@@ -9,7 +9,7 @@ from einops import rearrange
 from diffusers.utils import deprecate
 from diffusers.models.activations import GEGLU, GELU, ApproximateGELU, SwiGLU
 
-from .modeling_normalization import (
+from .normalization import (
     AdaLayerNormContinuous, AdaLayerNormZero, 
     AdaLayerNormZeroSingle, FP32LayerNorm, RMSNorm
 )
